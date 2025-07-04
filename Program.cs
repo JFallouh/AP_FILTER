@@ -2,7 +2,7 @@
 // File: Program.cs
 // Date: 2025-07-04
 // Purpose: Split RL_NEW_PAYABLES_TLC_TM.XLS into P1 (digits-only IDINVC) and P2 (others),
-//          preserving ALL sheets (filtering only Invoices & Invoice_Details).
+//          preserving ALL sheets (filtering only Invoices & Invoice_Details) and keeping formatting.
 
 using System;
 using System.Collections.Generic;
@@ -100,50 +100,96 @@ namespace PayablesSplitter
         {
             var wb = new HSSFWorkbook();
 
-            CopySheet(wb, "Invoices",        invRows, invHdr);
-            CopySheet(wb, "Invoice_Details", detRows, detHdr);
+            CopySheet(wb, srcWb, "Invoices",        invRows, invHdr);
+            CopySheet(wb, srcWb, "Invoice_Details", detRows, detHdr);
 
-            // Copy any other sheets unchanged
+            // Copy other sheets unchanged
             foreach (ISheet src in srcWb)
             {
-                var name = src.SheetName;
-                if (name is "Invoices" or "Invoice_Details") continue;
+                if (src.SheetName is "Invoices" or "Invoice_Details") continue;
 
                 var allRows = new List<IRow>();
                 for (int r = 0; r <= src.LastRowNum; r++)
-                    if (src.GetRow(r) is IRow row)
-                        allRows.Add(row);
+                    if (src.GetRow(r) is IRow row) allRows.Add(row);
 
-                CopySheet(wb, name, allRows, allRows[0]);
+                CopySheet(wb, srcWb, src.SheetName, allRows, allRows[0]);
             }
             return wb;
         }
 
-        static void CopySheet(HSSFWorkbook wb, string name, List<IRow> rows, IRow header)
+        /* -----------  COPY SHEET WITH FORMATTING  ----------- */
+
+        static void CopySheet(
+            HSSFWorkbook destWb,
+            HSSFWorkbook srcWb,
+            string name,
+            List<IRow> srcRows,
+            IRow srcHeader)
         {
-            var sheet = wb.CreateSheet(name);
-            for (int i = 0; i < rows.Count; i++)
+            var sheet = destWb.CreateSheet(name);
+
+            // style & font caches
+            var styleMap = new Dictionary<short, ICellStyle>();
+            var fontMap  = new Dictionary<short, short>();
+
+            // column widths
+            for (int c = 0; c < srcHeader.LastCellNum; c++)
+                sheet.SetColumnWidth(c, srcHeader.Sheet.GetColumnWidth(c));
+
+            for (int r = 0; r < srcRows.Count; r++)
             {
-                var src = rows[i];
-                var dst = sheet.CreateRow(i);
-                for (int c = 0; c < header.LastCellNum; c++)
+                var srcRow = srcRows[r];
+                var dstRow = sheet.CreateRow(r);
+                dstRow.Height = srcRow.Height;
+
+                for (int c = 0; c < srcHeader.LastCellNum; c++)
                 {
-                    var sc = src.GetCell(c);
+                    var sc = srcRow.GetCell(c);
                     if (sc == null) continue;
-                    var dc = dst.CreateCell(c);
+                    var dc = dstRow.CreateCell(c, sc.CellType);
+
+                    // copy value
                     switch (sc.CellType)
                     {
                         case CellType.String:  dc.SetCellValue(sc.StringCellValue);  break;
                         case CellType.Numeric: dc.SetCellValue(sc.NumericCellValue); break;
                         case CellType.Boolean: dc.SetCellValue(sc.BooleanCellValue); break;
+                        case CellType.Formula: dc.SetCellFormula(sc.CellFormula);    break;
                         default:               dc.SetCellValue(sc.ToString());      break;
                     }
+
+                    // copy style
+                    var srcStyleIdx = sc.CellStyle.Index;
+                    if (!styleMap.TryGetValue(srcStyleIdx, out var dstStyle))
+                    {
+                        dstStyle = destWb.CreateCellStyle();
+                        dstStyle.CloneStyleFrom(sc.CellStyle);
+
+                        // clone font
+                        short srcFontIdx = sc.CellStyle.FontIndex;
+                        if (!fontMap.TryGetValue(srcFontIdx, out var dstFontIdx))
+                        {
+                            var srcFont = srcWb.GetFontAt(srcFontIdx);
+                            var dstFont = destWb.CreateFont();
+                            dstFont.Boldweight       = srcFont.Boldweight;
+                            dstFont.Color            = srcFont.Color;
+                            dstFont.FontHeight       = srcFont.FontHeight;
+                            dstFont.FontName         = srcFont.FontName;
+                            dstFont.IsItalic         = srcFont.IsItalic;
+                            dstFont.Underline        = srcFont.Underline;
+                            dstFontIdx               = dstFont.Index;
+                            fontMap[srcFontIdx]      = dstFontIdx;
+                        }
+                        dstStyle.SetFont(destWb.GetFontAt(dstFontIdx));
+                        styleMap[srcStyleIdx] = dstStyle;
+                    }
+                    dc.CellStyle = dstStyle;
                 }
             }
         }
 
         /// <summary>
-        /// Delete & rewrite file, retrying up to 5 times (1 s delay) if locked.
+        /// Delete & rewrite; retry up to 5 × (1 s) if file is locked.
         /// </summary>
         static void SaveWorkbookWithRetry(HSSFWorkbook wb, string path)
         {
@@ -153,22 +199,19 @@ namespace PayablesSplitter
                 try
                 {
                     if (File.Exists(path)) File.Delete(path);
-
-                    using var fs = new FileStream(path,
-                                                  FileMode.Create,
-                                                  FileAccess.Write,
-                                                  FileShare.Read);
+                    using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read);
                     wb.Write(fs);
                     return;
                 }
                 catch (IOException) when (attempt < maxAttempts)
                 {
-                    Thread.Sleep(1000);   // wait then retry
+                    Thread.Sleep(1000);
                 }
             }
         }
     }
 
+    /* ------------ extension ------------- */
     static class RowExtensions
     {
         public static ICell? GetCell(this IRow row, string columnName)
